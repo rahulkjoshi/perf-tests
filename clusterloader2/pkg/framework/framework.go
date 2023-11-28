@@ -269,44 +269,78 @@ func (f *Framework) GetObject(gvk schema.GroupVersionKind, namespace string, nam
 	return client.GetObject(f.dynamicClients.GetClient(), gvk, namespace, name)
 }
 
-// ApplyTemplatedManifests finds and applies all manifest template files matching the provided
-// manifestGlob pattern. It substitutes the template placeholders using the templateMapping map.
-func (f *Framework) ApplyTemplatedManifests(fsys fs.FS, manifestGlob string, templateMapping map[string]interface{}, options ...*client.APICallOptions) error {
+// BuildTemplatedManifests finds all manifest template files matching the
+// provided manifestGlob pattern. It substitutes the template placeholders
+// using the templateMapping map.
+func (f *Framework) BuildTemplatedManifests(fsys fs.FS, manifestGlob string, templateMapping map[string]interface{}) (map[string][]unstructured.Unstructured, error) {
 	// TODO(mm4tt): Consider using the out-of-the-box "kubectl create -f".
-	klog.Infof("Applying templates for %q", manifestGlob)
-
 	templateProvider := config.NewTemplateProvider(fsys)
 	manifests, err := fs.Glob(fsys, manifestGlob)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if manifests == nil {
 		klog.Warningf("There is no matching file for pattern %v.\n", manifestGlob)
 	}
+	objs := make(map[string][]unstructured.Unstructured, len(manifests))
 	for _, manifest := range manifests {
-		klog.V(1).Infof("Applying %s\n", manifest)
+		if objs[manifest] == nil {
+			objs[manifest] = []unstructured.Unstructured{}
+		}
+		klog.V(1).Infof("Building %s\n", manifest)
 		obj, err := templateProvider.TemplateToObject(manifest, templateMapping)
 		if err != nil {
 			if err == config.ErrorEmptyFile {
 				klog.Warningf("Skipping empty manifest %s", manifest)
 				continue
 			}
-			return fmt.Errorf("TemplateToObject error: %+v", err)
+			return nil, fmt.Errorf("TemplateToObject error: %+v", err)
 		}
-		objList := []unstructured.Unstructured{*obj}
 		if obj.IsList() {
 			list, err := obj.ToList()
 			if err != nil {
-				return err
+				return nil, err
 			}
-			objList = list.Items
+			objs[manifest] = append(objs[manifest], list.Items...)
+		} else {
+			objs[manifest] = append(objs[manifest], *obj)
 		}
+	}
+	return objs, nil
+}
+
+// ApplyTemplatedManifests finds and applies all manifest template files matching the provided
+// manifestGlob pattern. It substitutes the template placeholders using the templateMapping map.
+func (f *Framework) ApplyTemplatedManifests(fsys fs.FS, manifestGlob string, templateMapping map[string]interface{}, options ...*client.APICallOptions) error {
+	klog.Infof("Applying templates for %q", manifestGlob)
+	objs, err := f.BuildTemplatedManifests(fsys, manifestGlob, templateMapping)
+	if err != nil {
+		return err
+	}
+	for manifest, objList := range objs {
+		klog.V(1).Infof("Applying %s\n", manifest)
 		for _, item := range objList {
 			if err := f.CreateObject(item.GetNamespace(), item.GetName(), &item, options...); err != nil {
 				return fmt.Errorf("error while applying (%s): %v", manifest, err)
 			}
 		}
+	}
+	return nil
+}
 
+func (f *Framework) DeleteTemplatedManifests(fsys fs.FS, manifestGlob string, templateMapping map[string]interface{}, options ...*client.APICallOptions) error {
+	klog.Infof("Deleting templates for %q", manifestGlob)
+	objs, err := f.BuildTemplatedManifests(fsys, manifestGlob, templateMapping)
+	if err != nil {
+		return err
+	}
+	for manifest, objList := range objs {
+		klog.V(1).Infof("Deleting %s\n", manifest)
+		for _, item := range objList {
+			if err := f.DeleteObject(item.GetObjectKind().GroupVersionKind(), item.GetNamespace(), item.GetName(), options...); err != nil {
+				return fmt.Errorf("error while applying (%s): %v", manifest, err)
+			}
+		}
 	}
 	return nil
 }
